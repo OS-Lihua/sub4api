@@ -114,7 +114,7 @@ type AccountRepository interface {
 	UpdateSessionWindowEnd(ctx context.Context, id int64, end time.Time) error
 	UpdateExtra(ctx context.Context, id int64, updates map[string]any) error
 	BulkUpdate(ctx context.Context, ids []int64, updates AccountBulkUpdate) (int64, error)
-	// IncrementQuotaUsed 原子递增 API Key 账号的配额用量（总/日/周）
+	// IncrementQuotaUsed 原子递增账号的配额用量（总/日/周）
 	IncrementQuotaUsed(ctx context.Context, id int64, amount float64) error
 	// ResetQuotaUsedAndClearRateLimitCooldown atomically resets API Key quota usage
 	// and clears only the account-level rate-limit cooldown.

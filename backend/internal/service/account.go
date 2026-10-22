@@ -203,7 +203,7 @@ func (a *Account) IsSchedulable() bool {
 	if a.TempUnschedulableUntil != nil && now.Before(*a.TempUnschedulableUntil) {
 		return false
 	}
-	if a.IsAPIKeyOrBedrock() && a.IsQuotaExceeded() {
+	if a.SupportsQuotaLimits() && a.IsQuotaExceeded() {
 		return false
 	}
 	return true
@@ -1325,9 +1325,15 @@ func (a *Account) IsBedrockAPIKey() bool {
 	return a.IsBedrock() && a.GetCredential("auth_mode") == "apikey"
 }
 
-// IsAPIKeyOrBedrock 返回账号类型是否支持配额和池模式等特性
+// IsAPIKeyOrBedrock 返回账号类型是否支持 API Key/Bedrock 池模式等特性。
 func (a *Account) IsAPIKeyOrBedrock() bool {
 	return a.Type == AccountTypeAPIKey || a.Type == AccountTypeBedrock
+}
+
+// SupportsQuotaLimits reports accounts with locally configured spending budgets.
+// OAuth budgets are independent of the upstream subscription plan or quota.
+func (a *Account) SupportsQuotaLimits() bool {
+	return a != nil && (a.IsAPIKeyOrBedrock() || (a.IsOpenAIOAuthLike() && !a.IsCredentialShadow()))
 }
 
 func (a *Account) IsOpenAI() bool {
@@ -2594,13 +2600,13 @@ func (a *Account) GetCacheTTLOverrideTarget() string {
 	return "5m"
 }
 
-// GetQuotaLimit 获取 API Key 账号的配额限制（美元）
+// GetQuotaLimit 获取账号的配额限制（美元）
 // 返回 0 表示未启用
 func (a *Account) GetQuotaLimit() float64 {
 	return a.getExtraFloat64("quota_limit")
 }
 
-// GetQuotaUsed 获取 API Key 账号的已用配额（美元）
+// GetQuotaUsed 获取账号的已用配额（美元）
 func (a *Account) GetQuotaUsed() float64 {
 	return a.getExtraFloat64("quota_used")
 }
@@ -3050,7 +3056,7 @@ func (a *Account) IsWeeklyQuotaPeriodExpired() bool {
 	return isPeriodExpired(start, 7*24*time.Hour)
 }
 
-// IsQuotaExceeded 检查 API Key 账号配额是否已超限（任一维度超限即返回 true）
+// IsQuotaExceeded 检查账号配额是否已超限（任一维度超限即返回 true）
 func (a *Account) IsQuotaExceeded() bool {
 	// 总额度
 	if limit := a.GetQuotaLimit(); limit > 0 && a.GetQuotaUsed() >= limit {

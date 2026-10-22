@@ -878,7 +878,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			quotaPlatform := service.QuotaPlatform(c.Request.Context(), apiKey)
 			sessionID := service.ExtractClientSessionID(c)
 			cyberBlocked := service.GetOpsCyberPolicy(c) != nil
-			h.submitMandatoryUsageRecordTask(c.Request.Context(), func(ctx context.Context) {
+			h.submitAccountUsageRecordTask(c.Request.Context(), account, func(ctx context.Context) {
 				if err := h.gatewayService.RecordUsage(ctx, &service.OpenAIRecordUsageInput{
 					Result:             res,
 					APIKey:             apiKey,
@@ -1483,7 +1483,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			quotaPlatform := service.QuotaPlatform(c.Request.Context(), apiKey)
 			sessionID := service.ExtractClientSessionID(c)
 			cyberBlocked := service.GetOpsCyberPolicy(c) != nil
-			h.submitMandatoryUsageRecordTask(c.Request.Context(), func(ctx context.Context) {
+			h.submitAccountUsageRecordTask(c.Request.Context(), account, func(ctx context.Context) {
 				if err := h.gatewayService.RecordUsage(ctx, &service.OpenAIRecordUsageInput{
 					Result:             res,
 					APIKey:             apiKey,
@@ -2930,6 +2930,29 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "billing check failed")
 			return
 		}
+		var turnQuotaAccount atomic.Pointer[service.Account]
+		var turnBillingFailed atomic.Bool
+		checkAccountTurnQuota := func() error {
+			if turnBillingFailed.Load() {
+				return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "previous turn billing failed, please reconnect", nil)
+			}
+			latest, err := h.gatewayService.CheckOpenAIAccountQuota(ctx, account)
+			if err != nil {
+				if errors.Is(err, service.ErrAccountQuotaExceeded) {
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account quota exhausted, please reconnect", err)
+				}
+				return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to check account spending quota", err)
+			}
+			turnQuotaAccount.Store(latest)
+			return nil
+		}
+		if err := checkAccountTurnQuota(); err != nil {
+			var closeErr *service.OpenAIWSClientCloseError
+			if errors.As(err, &closeErr) {
+				closeOpenAIClientWS(wsConn, closeErr.StatusCode(), closeErr.Reason())
+			}
+			return
+		}
 		hooks := &service.OpenAIWSIngressHooks{
 			ClientLifecycleContext:      clientLifecycleCtx,
 			InitialRequestModel:         reqModel,
@@ -3064,7 +3087,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				}
 				currentUserRelease = wrapReleaseOnDone(ctx, userReleaseFunc)
 				currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
-				return checkSimpleModeTurnBilling()
+				if err := checkSimpleModeTurnBilling(); err != nil {
+					return err
+				}
+				return checkAccountTurnQuota()
 			},
 			AfterTurn: func(turn int, result *service.OpenAIForwardResult, turnErr error) {
 				turnStart := getTurnStart(turn)
@@ -3075,7 +3101,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				defer func() {
 					clearCyberPolicyAttemptState(c, !cyberBlockPendingAfterFailover)
 				}()
-				releaseTurnSlots()
+				// Budgeted turns settle before their concurrency slots are released.
+				defer releaseTurnSlots()
+				billingAccount := turnQuotaAccount.Load()
 				turnRequestedModel := reqModel
 				turnUpstreamModel := ""
 				if result != nil && turn > 1 {
@@ -3097,7 +3125,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				}
 				turnUsageFields := turnMapping.ToUsageFields(turnRequestedModel, turnUpstreamModel)
 				cyberMarked := service.GetOpsCyberPolicy(c) != nil
-				h.recordCyberPolicyIfMarked(ctx, c, apiKey, account, subscription, turnRequestedModel, turnErr != nil, cyberBlockBody, turnUsageFields, requestPayloadHash)
+				h.recordCyberPolicyIfMarked(ctx, c, apiKey, billingAccount, subscription, turnRequestedModel, turnErr != nil, cyberBlockBody, turnUsageFields, requestPayloadHash)
 				cyberBlockedThisConn, cyberBlockPendingAfterFailover = advanceOpenAIWSCyberBlockState(
 					cyberBlockedThisConn,
 					cyberBlockPendingAfterFailover,
@@ -3144,12 +3172,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				sessionID := service.ExtractClientSessionID(c)
 				turnRecordPricingAt := turnPricing.currentOr(turnStart)
 				cyberBlocked := service.GetOpsCyberPolicy(c) != nil
-				h.submitMandatoryUsageRecordTask(ctx, func(taskCtx context.Context) {
+				if !h.submitAccountUsageRecordTask(ctx, billingAccount, func(taskCtx context.Context) {
 					if err := h.gatewayService.RecordUsage(taskCtx, &service.OpenAIRecordUsageInput{
 						Result:             result,
 						APIKey:             apiKey,
 						User:               apiKey.User,
-						Account:            account,
+						Account:            billingAccount,
 						Subscription:       subscription,
 						InboundEndpoint:    inboundEndpoint,
 						UpstreamEndpoint:   upstreamEndpoint,
@@ -3163,13 +3191,18 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 						PricingAt:          turnRecordPricingAt,
 						CyberBlocked:       cyberBlocked,
 					}); err != nil {
+						if billingAccount.SupportsQuotaLimits() && billingAccount.HasAnyQuotaLimit() {
+							turnBillingFailed.Store(true)
+						}
 						reqLog.Error("openai.websocket_record_usage_failed",
 							zap.Int64("account_id", account.ID),
 							zap.String("request_id", result.RequestID),
 							zap.Error(err),
 						)
 					}
-				})
+				}) {
+					turnBillingFailed.Store(true)
+				}
 			},
 		}
 
@@ -3464,6 +3497,24 @@ func (h *OpenAIGatewayHandler) submitMandatoryUsageRecordTask(parent context.Con
 			zap.String("component", "handler.openai_gateway.usage"),
 		).Warn("openai.usage_record_task_mandatory_sync_fallback")
 	}
+	h.runUsageRecordTask(task)
+}
+
+// Budgeted requests settle inline so a WS cannot run ahead of its previous
+// turn's committed cost. False means a panic interrupted inline settlement.
+func (h *OpenAIGatewayHandler) submitAccountUsageRecordTask(parent context.Context, account *service.Account, task service.UsageRecordTask) bool {
+	if task == nil {
+		return true
+	}
+	if !account.SupportsQuotaLimits() || !account.HasAnyQuotaLimit() {
+		h.submitMandatoryUsageRecordTask(parent, task)
+		return true
+	}
+	task, _ = wrapUsageRecordTaskContext(parent, task)
+	return h.runUsageRecordTask(task)
+}
+
+func (h *OpenAIGatewayHandler) runUsageRecordTask(task service.UsageRecordTask) (completed bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	defer func() {
@@ -3475,6 +3526,7 @@ func (h *OpenAIGatewayHandler) submitMandatoryUsageRecordTask(parent context.Con
 		}
 	}()
 	task(ctx)
+	return true
 }
 
 func (h *OpenAIGatewayHandler) acquireImageGenerationSlot(c *gin.Context, streamStarted bool) (func(), bool) {
@@ -4403,6 +4455,35 @@ func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(requestCtx context.Cont
 		// its reservation; billing may not start until after the handler returns.
 		billingDone = service.InflightReservationFromContext(requestCtx).Acquire()
 	}
+	recordCyberUsage := func(ctx context.Context) {
+		if forwardErrored && gwSvc != nil {
+			gwSvc.RecordCyberPolicyUsageLog(ctx, service.CyberPolicyUsageInput{
+				APIKey:             apiKey,
+				Account:            account,
+				Subscription:       subscription,
+				RequestID:          requestID,
+				Model:              model,
+				Stream:             stream,
+				InputTokens:        mark.UpstreamInTok,
+				OutputTokens:       mark.UpstreamOutTok,
+				InboundEndpoint:    inboundEndpoint,
+				UpstreamEndpoint:   upstreamEndpoint,
+				UserAgent:          userAgent,
+				IPAddress:          clientIPStr,
+				SessionID:          sessionID,
+				RequestPayloadHash: requestPayloadHash,
+				APIKeyService:      apiKeySvc,
+				NativeCompactionV2: nativeCompactionV2,
+				ChannelUsageFields: channelFields,
+			})
+		}
+	}
+	inlineAccountBudget := forwardErrored && gwSvc != nil && account.SupportsQuotaLimits() && account.HasAnyQuotaLimit()
+	if inlineAccountBudget {
+		billingCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		recordCyberUsage(billingCtx)
+		cancel()
+	}
 	go func() {
 		if billingDone != nil {
 			defer billingDone()
@@ -4428,26 +4509,8 @@ func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(requestCtx context.Cont
 				UpstreamOutTok:  mark.UpstreamOutTok,
 			})
 		}
-		if forwardErrored && gwSvc != nil {
-			gwSvc.RecordCyberPolicyUsageLog(ctx, service.CyberPolicyUsageInput{
-				APIKey:             apiKey,
-				Account:            account,
-				Subscription:       subscription,
-				RequestID:          requestID,
-				Model:              model,
-				Stream:             stream,
-				InputTokens:        mark.UpstreamInTok,
-				OutputTokens:       mark.UpstreamOutTok,
-				InboundEndpoint:    inboundEndpoint,
-				UpstreamEndpoint:   upstreamEndpoint,
-				UserAgent:          userAgent,
-				IPAddress:          clientIPStr,
-				SessionID:          sessionID,
-				RequestPayloadHash: requestPayloadHash,
-				APIKeyService:      apiKeySvc,
-				NativeCompactionV2: nativeCompactionV2,
-				ChannelUsageFields: channelFields,
-			})
+		if !inlineAccountBudget {
+			recordCyberUsage(ctx)
 		}
 		if opsSvc != nil {
 			enqueueOpsErrorLog(opsSvc, buildCyberPolicyOpsErrorEntry(opsMeta, mark))

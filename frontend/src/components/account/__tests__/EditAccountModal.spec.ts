@@ -331,6 +331,23 @@ describe('EditAccountModal', () => {
 
   afterEach(() => vi.useRealTimers())
 
+  it.each(['oauth', 'setup-token'])('loads and saves OpenAI %s spending budgets', async (type) => {
+    const account = buildOpenAIOAuthParentAccount()
+    account.type = type
+    account.extra = { ...account.extra, quota_daily_limit: 15, quota_weekly_limit: 70 }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    const quota = wrapper.getComponent({ name: 'QuotaLimitCard' })
+    expect(quota.props('dailyLimit')).toBe(15)
+    expect(quota.props('weeklyLimit')).toBe(70)
+    quota.vm.$emit('update:dailyLimit', 20)
+    quota.vm.$emit('update:weeklyLimit', 90)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).toMatchObject({ quota_daily_limit: 20, quota_weekly_limit: 90 })
+  })
+
   it('passes existing non-identity mappings to the whitelist selector and preserves them on save', async () => {
     const account = buildAccount()
     account.credentials.model_mapping = { 'gpt-5.2': 'gpt-5.2', 'gpt-latest': 'deepseek-chat' }

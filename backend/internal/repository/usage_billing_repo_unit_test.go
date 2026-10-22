@@ -161,6 +161,30 @@ func TestApplyUsageBillingEffects_APIKeyCounterErrorStillFails(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestApplyUsageBillingEffects_UpdatesOAuthAccountQuota(t *testing.T) {
+	ctx := context.Background()
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	mock.ExpectBegin()
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	mock.ExpectQuery(`(?s)UPDATE accounts SET extra = .*WHERE id = \$2 AND deleted_at IS NULL.*RETURNING`).
+		WithArgs(3.5, int64(42)).
+		WillReturnRows(sqlmock.NewRows([]string{"total_used", "total_limit", "daily_used", "daily_limit", "weekly_used", "weekly_limit"}).AddRow(3.5, 100, 3.5, 10, 3.5, 50))
+	mock.ExpectCommit()
+	result := &service.UsageBillingApplyResult{Applied: true}
+	err = (&usageBillingRepository{}).applyUsageBillingEffects(ctx, tx, &service.UsageBillingCommand{
+		AccountID: 42, AccountType: service.AccountTypeOAuth, AccountQuotaCost: 3.5,
+	}, result)
+	require.NoError(t, err)
+	require.NotNil(t, result.QuotaState)
+	require.Equal(t, 3.5, result.QuotaState.DailyUsed)
+	require.Equal(t, 3.5, result.QuotaState.WeeklyUsed)
+	require.NoError(t, tx.Commit())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestDeductUsageBillingBalance_ReturnsUserNotFoundWhenNoUserUpdated(t *testing.T) {
 	ctx := context.Background()
 	db, mock, err := sqlmock.New()
