@@ -605,6 +605,11 @@ func normalizeOpenAIWSPayloadWithoutInputAndPreviousResponseID(payload []byte) (
 	// from Codex's own websocket reuse comparison.
 	delete(decoded, "client_metadata")
 	delete(decoded, "stream_options")
+	// Native response.create defaults to streaming; HTTP-to-WS writes true
+	// explicitly. They must compare equally when resuming the same context.
+	if _, exists := decoded["stream"]; !exists {
+		decoded["stream"] = true
+	}
 	// Official Codex prewarms a connection with generate=false, then omits the
 	// field on the business request that continues from the prewarm response.
 	// Only normalize false so a meaningful generate=true change remains visible.
