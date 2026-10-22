@@ -808,6 +808,7 @@ func classifyOpenAIWSReconnectReason(err error) (string, bool) {
 
 	switch baseReason {
 	case "read_event",
+		"session_context_lost",
 		"write_request",
 		"write",
 		"acquire_timeout",

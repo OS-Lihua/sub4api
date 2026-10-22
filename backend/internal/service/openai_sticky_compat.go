@@ -120,6 +120,9 @@ func (s *OpenAIGatewayService) openAIStickyLegacyTTL(ttl time.Duration) time.Dur
 }
 
 func (s *OpenAIGatewayService) getStickySessionAccountID(ctx context.Context, groupID *int64, sessionHash string) (int64, error) {
+	if accountID := openAIWSSessionAffinityAccountID(ctx, derefGroupID(groupID)); accountID > 0 {
+		return accountID, nil
+	}
 	if s == nil || s.cache == nil {
 		return 0, nil
 	}

@@ -2475,6 +2475,11 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		}
 	}
 	stickyWeighted := s.isOpenAIAdvancedSchedulerStickyWeightedEnabled(ctx)
+	liveWSAccountID := openAIWSSessionAffinityAccountID(ctx, derefGroupID(groupID))
+	if platform == PlatformOpenAI && liveWSAccountID > 0 {
+		stickyAccountID = liveWSAccountID
+		stickyWeighted = false
+	}
 	subscriptionPriority := s.isOpenAIAdvancedSchedulerSubscriptionPriorityEnabled(ctx)
 	stickyPreviousAccountID := int64(0)
 	if stickyWeighted && previousResponseCanMove && strings.TrimSpace(previousResponseID) != "" && platform == PlatformOpenAI {
@@ -2491,6 +2496,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		StickyWeighted:          stickyWeighted,
 		SubscriptionPriority:    subscriptionPriority,
 		PreserveStickyBinding:   preserveGuardianParentBinding,
+		DisableStickyEscape:     platform == PlatformOpenAI && liveWSAccountID > 0,
 		RequirePrivacySet:       s.openAIGroupRequiresPrivacySet(ctx, groupID),
 		PreviousResponseID:      previousResponseID,
 		PreviousResponseCanMove: previousResponseCanMove,

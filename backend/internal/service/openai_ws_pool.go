@@ -83,6 +83,8 @@ type openAIWSAcquireRequest struct {
 	ForceNewConn bool
 	// ForcePreferredConn: 强制本次只使用 PreferredConnID，禁止漂移到其它连接。
 	ForcePreferredConn bool
+	// PreserveSessionAffinity prefers unused slots before replacing live contexts.
+	PreserveSessionAffinity bool
 }
 
 type openAIWSHandshakeCompatibilityKey struct {
@@ -306,10 +308,11 @@ type openAIWSConn struct {
 	// unusable 表示空闲期收到数据被判为脏连接：持有令牌不再借出，由池在锁外关闭。
 	unusable atomic.Bool
 
-	waiters       atomic.Int32
-	createdAtNano atomic.Int64
-	lastUsedNano  atomic.Int64
-	prewarmed     atomic.Bool
+	waiters                  atomic.Int32
+	createdAtNano            atomic.Int64
+	lastUsedNano             atomic.Int64
+	prewarmed                atomic.Bool
+	sessionAffinityExpiresAt atomic.Int64
 }
 
 func newOpenAIWSConn(id string, _ int64, ws openAIWSClientConn, handshakeHeaders http.Header) *openAIWSConn {
@@ -856,7 +859,8 @@ type openAIWSConnPool struct {
 	accounts sync.Map // key: int64(accountID), value: *openAIWSAccountPool
 	seq      atomic.Uint64
 
-	metrics openAIWSPoolMetrics
+	metrics           openAIWSPoolMetrics
+	sessionAffinities openAIWSSessionAffinityStore
 
 	workerStopCh chan struct{}
 	workerWg     sync.WaitGroup
@@ -932,6 +936,7 @@ func (p *openAIWSConnPool) Close() {
 			ap.mu.Unlock()
 			return true
 		})
+		p.sessionAffinities.cleanup(time.Now())
 	})
 }
 
@@ -1098,6 +1103,7 @@ func (p *openAIWSConnPool) runBackgroundCleanupSweep(now time.Time) {
 	for _, result := range results {
 		closeOpenAIWSConns(result.evicted)
 	}
+	p.sessionAffinities.cleanup(now)
 }
 
 // openAIWSAcquireQueueWait 跨广播重选与递归重试累计一次获取的排队耗时，
@@ -1166,6 +1172,7 @@ retryAcquire:
 	allowReuse := !req.ForceNewConn
 	preferredConnID := stringsTrim(req.PreferredConnID)
 	forcePreferredConn := allowReuse && req.ForcePreferredConn
+	preferUnusedSlot := req.PreserveSessionAffinity && preferredConnID == ""
 
 	if allowReuse {
 		if forcePreferredConn {
@@ -1297,6 +1304,9 @@ retryAcquire:
 		// connection whose handshake used the same hint, but do not make that
 		// preference a continuation compatibility requirement.
 		best := p.pickLeastBusyConnWithRoutingAffinityLocked(ap, compatibility, routingAffinity)
+		if preferUnusedSlot {
+			best = p.pickSessionSlotLocked(ap, compatibility, routingAffinity, len(ap.conns)+ap.creating >= effectiveMaxConns)
+		}
 		if best != nil && best.tryAcquire() {
 			connPick := time.Since(pickStartedAt)
 			p.recordConnPickDuration(connPick)
@@ -1320,7 +1330,7 @@ retryAcquire:
 		} else if best != nil {
 			p.dropDeadConnLocked(ap, best, &evicted)
 		}
-		if routingAffinity == "" || len(ap.conns)+ap.creating >= effectiveMaxConns {
+		if !preferUnusedSlot && (routingAffinity == "" || len(ap.conns)+ap.creating >= effectiveMaxConns) {
 			for _, conn := range ap.conns {
 				if conn == nil || conn == best || !conn.matchesHandshakeCompatibility(compatibility) {
 					continue
@@ -1706,7 +1716,7 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 				continue
 			}
 			// 有等待者的连接不能在清理阶段被淘汰，否则等待中的 acquire 会收到 closed 错误。
-			if conn.isLeased() || conn.waiters.Load() > 0 || p.isConnPinnedLocked(ap, conn.id) {
+			if conn.isLeased() || conn.waiters.Load() > 0 || p.isConnPinnedLocked(ap, conn.id) || conn.hasSessionAffinity(now) {
 				continue
 			}
 			idleConns = append(idleConns, conn)
@@ -2061,6 +2071,7 @@ func (p *openAIWSConnPool) evictConn(accountID int64, connID string) {
 		ap.mu.Unlock()
 	}
 	if conn != nil {
+		p.sessionAffinities.forget(conn)
 		conn.close()
 	}
 }

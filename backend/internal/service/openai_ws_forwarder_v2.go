@@ -34,6 +34,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	reqBody map[string]any,
 	clientPromptCacheKey string,
 	executionScope string,
+	sessionIdentity openAIWSSessionIdentity,
 	token string,
 	decision OpenAIWSProtocolDecision,
 	isCodexCLI bool,
@@ -194,6 +195,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if account.UsesOpenAICodexProtocol() {
 		projectCodexOutboundHeaders(wsHeaders, true)
 	}
+	pool := s.getOpenAIWSConnPool()
+	affinity := pool.sessionAffinities.lookup(sessionIdentity, previousResponseID)
+	if affinity != nil && affinity.accountID == account.ID {
+		preferredConnID = affinity.conn.id
+		forceNewConn = false
+	} else {
+		affinity = nil
+	}
 
 	logOpenAIWSModeDebug(
 		"acquire_start account_id=%d account_type=%s transport=%s preferred_conn_id=%s has_previous_response_id=%v session_hash=%s has_turn_state=%v turn_state_len=%d has_turn_metadata=%v turn_metadata_len=%d store_disabled=%v store_disabled_conn_mode=%s retry_last_reason=%s force_new_conn=%v header_user_agent=%s header_openai_beta=%s header_originator=%s header_accept_language=%s header_session_id=%s header_conversation_id=%s session_id_source=%s conversation_id_source=%s has_prompt_cache_key=%v has_chatgpt_account_id=%v has_authorization=%v has_session_id=%v has_conversation_id=%v proxy_enabled=%v",
@@ -238,8 +247,10 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIWSAuthHeaders(factoryCtx, account, headers)
 		},
-		PreferredConnID: preferredConnID,
-		ForceNewConn:    forceNewConn,
+		PreferredConnID:         preferredConnID,
+		ForceNewConn:            forceNewConn,
+		ForcePreferredConn:      affinity != nil,
+		PreserveSessionAffinity: true,
 		ProxyURL: func() string {
 			if account.ProxyID != nil && account.Proxy != nil {
 				return account.Proxy.URL()
@@ -247,7 +258,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			return ""
 		}(),
 	}
-	lease, err := s.acquireOpenAIWSWithAuthRecovery(acquireCtx, s.getOpenAIWSConnPool(), &acquireRequest)
+	lease, err := s.acquireOpenAIWSWithAuthRecovery(acquireCtx, pool, &acquireRequest)
+	if errors.Is(err, errOpenAIWSPreferredConnUnavailable) && affinity != nil && previousResponseID == "" {
+		// No delta has been sent yet, so a lost cached socket can safely restart
+		// from the original full history on any available slot.
+		acquireRequest.PreferredConnID = ""
+		acquireRequest.ForcePreferredConn = false
+		lease, err = s.acquireOpenAIWSWithAuthRecovery(acquireCtx, pool, &acquireRequest)
+	}
 	if err != nil {
 		var agentDialErr *openAIWSDialError
 		if s.isAgentIdentityAccount(ctx, account) && errors.As(err, &agentDialErr) && isAgentIdentityTaskInvalidWSDialError(agentDialErr) && agentTaskRecoveryTried != nil && !*agentTaskRecoveryTried {
@@ -372,7 +390,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		return nil, err
 	}
 
-	if err := lease.WriteJSONWithContextTimeout(ctx, payload, s.openAIWSWriteTimeout()); err != nil {
+	wirePayload, pendingAffinity, incremental := pool.sessionAffinities.prepare(lease, sessionIdentity, payloadAsJSONBytes(payload))
+	if incremental {
+		previousResponseID = openAIWSPayloadStringFromRaw(wirePayload, "previous_response_id")
+		previousResponseIDKind = ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
+		payloadBytes = len(wirePayload)
+		logOpenAIWSModeDebug("session_incremental account_id=%d conn_id=%s previous_response_id=%s payload_bytes=%d", account.ID, connID, truncateOpenAIWSLogValue(previousResponseID, openAIWSIDValueMaxLen), payloadBytes)
+	}
+	if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(wirePayload), s.openAIWSWriteTimeout()); err != nil {
 		lease.MarkBroken()
 		logOpenAIWSModeInfo(
 			"write_request_fail account_id=%d conn_id=%s cause=%s payload_bytes=%d",
@@ -399,6 +424,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	var firstTokenMs *int
 	responseID := ""
 	var finalResponse []byte
+	var completedOutput []json.RawMessage
+	completedOutputKnown := false
 	wroteDownstream := false
 	needModelReplace := originalModel != mappedModel
 	var mappedModelBytes []byte
@@ -697,6 +724,9 @@ readLoop:
 			)
 		}
 
+		if isTerminalEvent {
+			completedOutput, completedOutputKnown = openAIWSSessionCompletedOutput(message, eventType)
+		}
 		if !clientDisconnected {
 			if needModelReplace && len(mappedModelBytes) > 0 && openAIWSEventMayContainModel(eventType) && bytes.Contains(message, mappedModelBytes) {
 				message = replaceOpenAIWSMessageModel(message, mappedModel, originalModel)
@@ -767,6 +797,11 @@ readLoop:
 			// error 事件后连接不再可复用，避免回池后污染下一请求。
 			lease.MarkBroken()
 			if !wroteDownstream && canFallback {
+				if incremental && fallbackReason == "previous_response_not_found" && openAIWSPayloadString(reqBody, "previous_response_id") == "" {
+					// The inferred context vanished upstream. The caller still owns
+					// the full request, including any historical tool calls.
+					fallbackReason = "session_context_lost"
+				}
 				return nil, wrapOpenAIWSFallback(fallbackReason, errors.New(errMsg))
 			}
 			statusCode := openAIWSErrorHTTPStatusFromRaw(errCodeRaw, errTypeRaw)
@@ -870,6 +905,11 @@ readLoop:
 		ttl := s.openAIWSResponseStickyTTL()
 		logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
 		stateStore.BindResponseConn(responseID, lease.ConnID(), ttl)
+	}
+	if cleanExit && completedOutputKnown && pendingAffinity != nil {
+		pool.sessionAffinities.bind(pendingAffinity, responseID, completedOutput)
+	} else {
+		pool.sessionAffinities.forget(lease.conn)
 	}
 	if stateStore != nil && sessionHash != "" {
 		stateStore.BindSessionConn(groupID, sessionHash, lease.ConnID(), s.openAIWSSessionStickyTTL())

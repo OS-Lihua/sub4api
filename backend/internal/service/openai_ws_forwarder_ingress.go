@@ -844,11 +844,18 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			return ""
 		}(),
-		ForceNewConn: false,
+		ForceNewConn:            false,
+		PreserveSessionAffinity: true,
 	}
 	pool := s.getOpenAIWSConnPool()
 	if pool == nil {
 		return errors.New("openai ws conn pool is nil")
+	}
+	firstAffinity := pool.sessionAffinities.lookup(openAIWSSessionIdentityForRequest(c, firstClientMessage), firstPayload.previousResponseID)
+	if !dedicatedMode && firstAffinity != nil && firstAffinity.accountID == account.ID {
+		preferredConnID = firstAffinity.conn.id
+	} else {
+		firstAffinity = nil
 	}
 
 	logOpenAIWSModeInfo(
@@ -1000,11 +1007,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	var rejectedFieldRetryState *openAIResponsesRejectedFieldRetryState
-	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string) (*OpenAIForwardResult, error) {
+	sendAndRelay := func(turn int, lease *openAIWSConnLease, identity openAIWSSessionIdentity, payload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string) (*OpenAIForwardResult, error) {
 		responseModelObserver := &upstreamResponseModelObserver{}
 		if lease == nil {
 			return nil, errors.New("upstream websocket lease is nil")
 		}
+		originalPreviousID := openAIWSPayloadStringFromRaw(payload, "previous_response_id")
+		wirePayload, pendingAffinity, incremental := pool.sessionAffinities.prepare(lease, identity, payload)
+		payload = wirePayload
+		payloadBytes = len(payload)
 		turnStart := time.Now()
 		wroteDownstream := false
 		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
@@ -1171,6 +1182,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 				// previous_response_not_found 在 ingress 模式支持单次恢复重试：
 				// 不把该 error 直接下发客户端，而是由上层去掉 previous_response_id 后重放当前 turn。
+				if incremental && originalPreviousID == "" && fallbackReason == "previous_response_not_found" && !wroteDownstream {
+					lease.MarkBroken()
+					return nil, wrapOpenAIWSIngressTurnError("session_context_lost", errors.New("inferred websocket context is unavailable"), false)
+				}
 				if recoverablePrevNotFound {
 					lease.MarkBroken()
 					errMsg := strings.TrimSpace(errMsgRaw)
@@ -1255,6 +1270,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			if isTerminalEvent {
 				terminalEvent := s.handleOpenAIWSTerminalTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), upstreamMessage)
+				if items, completed := openAIWSSessionCompletedOutput(upstreamMessage, eventType); completed && !clientDisconnected && pendingAffinity != nil {
+					pool.sessionAffinities.bind(pendingAffinity, responseID, items)
+				} else {
+					pool.sessionAffinities.forget(lease.conn)
+				}
 				// 客户端已断连时，上游连接的 session 状态不可信，标记 broken 避免回池复用。
 				if clientDisconnected {
 					lease.MarkBroken()
@@ -1709,8 +1729,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 		}
 		forcePreferredConn := isStrictAffinityTurn(currentPayload)
+		if turn == 1 && turnRetry == 0 && firstAffinity != nil && preferredConnID == firstAffinity.conn.id {
+			forcePreferredConn = true
+		}
 		if sessionLease == nil {
 			acquiredLease, acquireErr := acquireTurnLease(turn, preferredConnID, forcePreferredConn, turnRetry > 0)
+			if errors.Is(acquireErr, errOpenAIWSPreferredConnUnavailable) && firstAffinity != nil && openAIWSPayloadStringFromRaw(currentPayload, "previous_response_id") == "" {
+				firstAffinity = nil
+				preferredConnID = ""
+				acquiredLease, acquireErr = acquireTurnLease(turn, "", false, false)
+			}
 			if acquireErr != nil {
 				return fmt.Errorf("acquire upstream websocket: %w", acquireErr)
 			}
@@ -1852,7 +1880,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 
-		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
+		result, relayErr := sendAndRelay(turn, sessionLease, openAIWSSessionIdentityForRequest(c, currentClientPayload), currentPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
 		if relayErr != nil {
 			lastTurnClean = false
 			if isOpenAIWSSessionPreempted(ctx) {

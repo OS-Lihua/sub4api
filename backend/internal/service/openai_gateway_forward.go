@@ -65,6 +65,7 @@ func (s *OpenAIGatewayService) forwardWithoutHostedWebSearch(ctx context.Context
 	// 请求体里的 client_metadata / prompt_cache_key，用改写后的值取键会让不同会话
 	// 落到同一个键，也会与 WS 接入路径按原始报文算出的键对不上。
 	wsExecutionScope, _ := resolveOpenAIWSExecutionScope(c, body, apiKeyID)
+	wsClientIdentityBody := body
 	logCodexCLIOnlyDetection(ctx, c, account, apiKeyID, restrictionResult, body)
 	if restrictionResult.Enabled && !restrictionResult.Matched {
 		MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalPolicyDenied)
@@ -852,6 +853,8 @@ func (s *OpenAIGatewayService) forwardWithoutHostedWebSearch(ctx context.Context
 	// 命中 WS 时仅走 WebSocket Mode；不再自动回退 HTTP。
 	if wsDecision.Transport == OpenAIUpstreamTransportResponsesWebsocketV2 {
 		// WS 分支需要结构化 payload 与重连恢复，命中后再触发 full-map decode。
+		wsSessionIdentity := openAIWSSessionIdentityForRequest(c, wsClientIdentityBody)
+		wsSessionIdentity.scope = wsExecutionScope
 		wsReqBody, err := ensureReqBody()
 		if err != nil {
 			return nil, err
@@ -958,6 +961,7 @@ func (s *OpenAIGatewayService) forwardWithoutHostedWebSearch(ctx context.Context
 				wsReqBody,
 				clientPromptCacheKey,
 				wsExecutionScope,
+				wsSessionIdentity,
 				token,
 				wsDecision,
 				isCodexCLI,

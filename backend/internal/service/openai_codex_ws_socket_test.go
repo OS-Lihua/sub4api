@@ -79,7 +79,7 @@ func TestCodexWSCompatibilityMetadataOnSocket(t *testing.T) {
 		c.Request.Header.Set("x-oai-attestation", "must-not-forward-client-proof")
 		payload := map[string]any{"model": "gpt-5.6-sol", "input": "hello", "client_metadata": map[string]any{"x-codex-turn-metadata": metadata}}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		result, err := svc.forwardOpenAIWSV2(ctx, c, account, payload, "wire-session", "wire-scope", "test-token", OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2}, true, true, "gpt-5.6-sol", "gpt-5.6-sol", time.Now(), 1, "", new(bool))
+		result, err := svc.forwardOpenAIWSV2(ctx, c, account, payload, "wire-session", "wire-scope", openAIWSSessionIdentity{}, "test-token", OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2}, true, true, "gpt-5.6-sol", "gpt-5.6-sol", time.Now(), 1, "", new(bool))
 		cancel()
 		require.NoError(t, err)
 		require.Equal(t, "response.completed", result.UpstreamTerminalEvent)
